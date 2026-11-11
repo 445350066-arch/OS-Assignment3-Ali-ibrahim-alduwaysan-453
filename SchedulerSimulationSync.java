@@ -12,7 +12,14 @@ import java.util.Random;
  * (Feature 1) and SharedStats counters (Feature 2).
  * ============================================================================= */
 import java.util.concurrent.locks.ReentrantLock;
-// TODO (Feature 3):               import java.util.concurrent.Semaphore;
+
+/* =============================================================================
+ * FEATURE 3: CONCURRENCY IMPORTS (Counting Semaphore)
+ * =============================================================================
+ * Required for blocking idle CPU workers and clean shutdown notification.
+ * ============================================================================= */
+import java.util.concurrent.Semaphore;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 // ANSI Color Codes for enhanced terminal output (same as Assignment 1)
 class Colors {
@@ -178,7 +185,14 @@ class ReadyQueue {
      * ========================================================================= */
     private final ReentrantLock readyQueueLock = new ReentrantLock();
 
-    // TODO Feature 3: declare the counting semaphore that counts the processes waiting in the ready queue here
+    /* =========================================================================
+     * FEATURE 3: CPU IDLE WAITING & NOTIFICATION (Counting Semaphore)
+     * =========================================================================
+     * Semaphore initialized to 0 (queue starts empty). Tracks number of ready
+     * processes available. CPU workers block (sleep) on acquire() when empty,
+     * eliminating busy-waiting. Producer calls release() on each enqueue.
+     * ========================================================================= */
+    private final Semaphore readyQueueSemaphore = new Semaphore(0);
 
     // Add a process to the ready queue (new process, or a process that did not finish its quantum)
     public void add(Process process) {
@@ -186,7 +200,7 @@ class ReadyQueue {
 
         /* =====================================================================
          * FEATURE 1: CRITICAL SECTION - ENQUEUE PROCESS (add)
-         * Protected via ReentrantLock with strict try-finally release
+         * Serialized with readyQueueLock to prevent race conditions on list & map
          * ===================================================================== */
         readyQueueLock.lock();
         try {
@@ -196,7 +210,11 @@ class ReadyQueue {
             readyQueueLock.unlock();
         }
 
-        // TODO Feature 3: signal that one more process is available in the queue
+        /* =====================================================================
+         * FEATURE 3: SIGNAL PROCESS AVAILABLE IN QUEUE (Semaphore release)
+         * Increments semaphore count, waking up one waiting idle CPU thread
+         * ===================================================================== */
+        readyQueueSemaphore.release();
 
         System.out.println(Colors.BLUE + "  ➕ " + Colors.BOLD + Colors.CYAN + process.getName() + Colors.RESET +
                 Colors.BLUE + " (Priority: " + process.getPriority() + ") added to ready queue" + Colors.RESET +
@@ -208,7 +226,7 @@ class ReadyQueue {
     public Thread poll() {
         /* =====================================================================
          * FEATURE 1: CRITICAL SECTION - DEQUEUE PROCESS (poll)
-         * Protected via ReentrantLock with strict try-finally release
+         * Atomic retrieval and removal to guarantee no duplicate or lost threads
          * ===================================================================== */
         readyQueueLock.lock();
         try {
@@ -226,8 +244,8 @@ class ReadyQueue {
 
     public Process processOf(Thread thread) {
         /* =====================================================================
-         * FEATURE 1: CRITICAL SECTION - LOOKUP PROCESS (processOf)
-         * Protected via ReentrantLock with strict try-finally release
+         * FEATURE 1: CRITICAL SECTION - PROCESS LOOKUP (processOf)
+         * Thread-safe access to internal map
          * ===================================================================== */
         readyQueueLock.lock();
         try {
@@ -240,8 +258,8 @@ class ReadyQueue {
     // Names of the processes currently waiting in the queue (used to display the ready queue)
     public String snapshot() {
         /* =====================================================================
-         * FEATURE 1: CRITICAL SECTION - QUEUE SNAPSHOT ITERATION (snapshot)
-         * Protected via ReentrantLock with strict try-finally release
+         * FEATURE 1: CRITICAL SECTION - READY QUEUE SNAPSHOT ITERATION (snapshot)
+         * Atomic iteration prevents ConcurrentModificationException
          * ===================================================================== */
         readyQueueLock.lock();
         try {
@@ -289,6 +307,18 @@ class ReadyQueue {
         } finally {
             readyQueueLock.unlock();
         }
+    }
+
+    /* =========================================================================
+     * FEATURE 3: SEMAPHORE SYNCHRONIZATION HELPERS
+     * acquire() blocks idle CPUs; releaseShutdown() wakes blocked CPUs on exit
+     * ========================================================================= */
+    public void acquire() throws InterruptedException {
+        readyQueueSemaphore.acquire();
+    }
+
+    public void releaseShutdown(int count) {
+        readyQueueSemaphore.release(count);
     }
 }
 
@@ -401,6 +431,7 @@ class Process implements Runnable {
 class CpuWorker extends Thread {
     private final int cpuId;
     private final ReadyQueue readyQueue;
+    private static final AtomicBoolean shutdownSignaled = new AtomicBoolean(false);
 
     public CpuWorker(int cpuId, ReadyQueue readyQueue) {
         super("CPU-" + cpuId);
@@ -412,18 +443,28 @@ class CpuWorker extends Thread {
     public void run() {
         while (SharedStats.getCompletedProcessCount() < SharedStats.totalProcesses) {
 
-            // TODO Feature 3: replace this polling loop by a blocking wait on the counting semaphore
+            /* =================================================================
+             * FEATURE 3: CPU IDLE WAITING (BLOCKING ACQUIRE - NO BUSY WAITING)
+             * =================================================================
+             * The CPU thread blocks on the counting semaphore until a process
+             * is available in the ready queue. Polling sleep(20) is removed.
+             * If awakened during shutdown when all processes are completed,
+             * the worker exits immediately without polling the empty queue.
+             * ================================================================= */
+            try {
+                readyQueue.acquire();
+            } catch (InterruptedException e) {
+                return;
+            }
+
+            // Check if awakened by the clean shutdown signal
+            if (SharedStats.getCompletedProcessCount() >= SharedStats.totalProcesses) {
+                break;
+            }
+
             Thread thread = readyQueue.poll();
             if (thread == null) {
-                // ⚠️ BUSY WAITING: the CPU keeps checking an empty queue instead of sleeping until
-                // a process is available. It wastes CPU time and needs the "completed == total" test above to stop.
-                SharedStats.busyWaitPolls.incrementAndGet();      // (counted for the verification block)
-                try {
-                    Thread.sleep(20);
-                } catch (InterruptedException e) {
-                    return;
-                }
-                continue;
+                break;
             }
 
             Process process = readyQueue.processOf(thread);
@@ -443,8 +484,17 @@ class CpuWorker extends Thread {
                 readyQueue.add(process);         // not finished: back to the ready queue
             }
 
-            // TODO Feature 3: when the LAST process has completed, wake up the CPUs that are blocked on the
-            // semaphore so that they can terminate (otherwise they would wait forever!)
+            /* =================================================================
+             * FEATURE 3: CLEAN SHUTDOWN SIGNALING
+             * =================================================================
+             * When the last process completes, the finishing CPU wakes up all
+             * remaining CPU workers blocked on the semaphore so they terminate cleanly.
+             * ================================================================= */
+            if (SharedStats.getCompletedProcessCount() >= SharedStats.totalProcesses) {
+                if (shutdownSignaled.compareAndSet(false, true)) {
+                    readyQueue.releaseShutdown(SharedStats.totalCPUs);
+                }
+            }
         }
     }
 }
