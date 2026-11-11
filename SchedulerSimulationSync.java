@@ -301,7 +301,11 @@ public class SchedulerSimulationSync {
     public static void main(String[] args) {
         // ⚠️ IMPORTANT: Put your student ID here to seed the random number generator
         // This makes your output unique to you - DO NOT forget to change this!
+<<<<<<< HEAD
         int studentID = 445350066;  // ← CHANGE THIS TO YOUR ACTUAL STUDENT ID
+=======
+        int studentID = 123456789;  // ← CHANGE THIS TO YOUR ACTUAL STUDENT ID
+>>>>>>> 09833ef133f1a85c1399bee4a753d1b5281972f0
 
         Random random = new Random(studentID);
 
