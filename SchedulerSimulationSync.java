@@ -6,9 +6,10 @@ import java.util.HashMap;
 import java.util.Random;
 
 /* =============================================================================
- * FEATURE 1: PROTECTING THE READY QUEUE (ReentrantLock Import)
+ * FEATURE 1 & FEATURE 2: CONCURRENCY IMPORTS (ReentrantLock)
  * =============================================================================
- * Required to serialize all reads, writes, and modifications to readyQueue.
+ * Required to serialize all reads, writes, and modifications in ReadyQueue
+ * (Feature 1) and SharedStats counters (Feature 2).
  * ============================================================================= */
 import java.util.concurrent.locks.ReentrantLock;
 // TODO (Feature 3):               import java.util.concurrent.Semaphore;
@@ -66,44 +67,98 @@ class SharedStats {
     // Number of times a CPU found the ready queue empty and polled it again (busy waiting). Must be 0 after Feature 3.
     static final java.util.concurrent.atomic.AtomicInteger busyWaitPolls = new java.util.concurrent.atomic.AtomicInteger(0);
 
-    // TODO Feature 2: declare the lock(s) protecting the three shared variables above here.
-    // Think about it: ONE lock for the three variables, or ONE lock PER variable? (you must justify it in MY_WORK.md)
+    /* =========================================================================
+     * FEATURE 2: MUTEX LOCKS FOR SHARED STATISTICS (ReentrantLock)
+     * =========================================================================
+     * Fine-grained lock design: We declare a dedicated ReentrantLock for each
+     * independent shared statistic (contextSwitchLock, completedProcessLock,
+     * serviceTimeLock). This prevents threads updating different counters from
+     * blocking each other unnecessarily, maximizing parallelism and throughput.
+     * ========================================================================= */
+    private static final ReentrantLock contextSwitchLock = new ReentrantLock();
+    private static final ReentrantLock completedProcessLock = new ReentrantLock();
+    private static final ReentrantLock serviceTimeLock = new ReentrantLock();
 
     public static void incrementContextSwitch() {
-        // TODO Feature 2: protect this critical section
-        int tmp = contextSwitchCount;       // 1) read
-        RaceWindow.pause();                 //    <- another thread can read the SAME value here
-        contextSwitchCount = tmp + 1;       // 2) write  (one increment is lost if someone else did the same)
+        /* =====================================================================
+         * FEATURE 2: CRITICAL SECTION - CONTEXT SWITCH COUNTER
+         * Protected via ReentrantLock with strict try-finally release
+         * ===================================================================== */
+        contextSwitchLock.lock();
+        try {
+            int tmp = contextSwitchCount;       // 1) read
+            RaceWindow.pause();                 //    simulated preemption window
+            contextSwitchCount = tmp + 1;       // 2) write (protected from lost updates)
+        } finally {
+            contextSwitchLock.unlock();
+        }
     }
 
     public static void incrementCompletedProcess() {
-        // TODO Feature 2: protect this critical section
-        int tmp = completedProcessCount;
-        RaceWindow.pause();
-        completedProcessCount = tmp + 1;
+        /* =====================================================================
+         * FEATURE 2: CRITICAL SECTION - COMPLETED PROCESS COUNTER
+         * Protected via ReentrantLock with strict try-finally release
+         * ===================================================================== */
+        completedProcessLock.lock();
+        try {
+            int tmp = completedProcessCount;
+            RaceWindow.pause();
+            completedProcessCount = tmp + 1;
+        } finally {
+            completedProcessLock.unlock();
+        }
     }
 
     public static void addServiceTime(int ms) {
-        // TODO Feature 2: protect this critical section
-        long tmp = totalServiceTime;
-        RaceWindow.pause();
-        totalServiceTime = tmp + ms;
+        /* =====================================================================
+         * FEATURE 2: CRITICAL SECTION - TOTAL SERVICE TIME ACCUMULATOR
+         * Protected via ReentrantLock with strict try-finally release
+         * ===================================================================== */
+        serviceTimeLock.lock();
+        try {
+            long tmp = totalServiceTime;
+            RaceWindow.pause();
+            totalServiceTime = tmp + ms;
+        } finally {
+            serviceTimeLock.unlock();
+        }
     }
 
     // Readers must also be protected (a read in the middle of an update is not safe either)
     public static int getCompletedProcessCount() {
-        // TODO Feature 2: protect this read
-        return completedProcessCount;
+        /* =====================================================================
+         * FEATURE 2: CRITICAL SECTION - READ COMPLETED PROCESS COUNTER
+         * ===================================================================== */
+        completedProcessLock.lock();
+        try {
+            return completedProcessCount;
+        } finally {
+            completedProcessLock.unlock();
+        }
     }
 
     public static int getContextSwitchCount() {
-        // TODO Feature 2: protect this read
-        return contextSwitchCount;
+        /* =====================================================================
+         * FEATURE 2: CRITICAL SECTION - READ CONTEXT SWITCH COUNTER
+         * ===================================================================== */
+        contextSwitchLock.lock();
+        try {
+            return contextSwitchCount;
+        } finally {
+            contextSwitchLock.unlock();
+        }
     }
 
     public static long getTotalServiceTime() {
-        // TODO Feature 2: protect this read
-        return totalServiceTime;
+        /* =====================================================================
+         * FEATURE 2: CRITICAL SECTION - READ TOTAL SERVICE TIME ACCUMULATOR
+         * ===================================================================== */
+        serviceTimeLock.lock();
+        try {
+            return totalServiceTime;
+        } finally {
+            serviceTimeLock.unlock();
+        }
     }
 }
 
@@ -265,7 +320,10 @@ class Process implements Runnable {
     public void run() {
         int runTime = Math.min(timeQuantum, remainingTime);
 
-        // Assignment 1 - Feature 2: a context switch happens every time a process starts running on a CPU
+        /* =====================================================================
+         * FEATURE 2: CONTEXT SWITCH EXECUTION & PREEMPTION ACCOUNTING
+         * Increments contextSwitchCount safely inside protected critical section
+         * ===================================================================== */
         SharedStats.incrementContextSwitch();
 
         System.out.println(Colors.BRIGHT_GREEN + "  ▶ [CPU-" + cpuId + "] " + Colors.BOLD + Colors.CYAN + name +
@@ -279,6 +337,11 @@ class Process implements Runnable {
         }
 
         remainingTime -= runTime;
+
+        /* =====================================================================
+         * FEATURE 2: SERVICE TIME ACCUMULATION
+         * Thread-safe update of cumulative CPU time
+         * ===================================================================== */
         SharedStats.addServiceTime(runTime);
 
         int overallProgress = (int) (((double) (burstTime - remainingTime) / burstTime) * 100);
@@ -288,10 +351,18 @@ class Process implements Runnable {
                 Colors.MAGENTA + "  remaining: " + remainingTime + "ms" + Colors.RESET);
 
         if (remainingTime > 0) {
+            /* =================================================================
+             * FEATURE 2: CPU QUANTUM YIELD (PREEMPTION SIGNALING)
+             * Current quantum elapsed; process yields CPU and returns to ready queue
+             * ================================================================= */
             System.out.println(Colors.BLUE + "  ↻ " + Colors.CYAN + name + Colors.RESET +
                     " yields CPU for context switch");
         } else {
             completionTime = System.currentTimeMillis();
+            /* =================================================================
+             * FEATURE 2: PROCESS COMPLETION TRACKING
+             * Thread-safe increment of completed process counter
+             * ================================================================= */
             SharedStats.incrementCompletedProcess();
             System.out.println(Colors.BRIGHT_GREEN + "  ✓ " + Colors.BOLD + Colors.CYAN + name + Colors.RESET +
                     Colors.BRIGHT_GREEN + " finished execution!" + Colors.RESET);
